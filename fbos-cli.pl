@@ -1,16 +1,15 @@
-#!/usr/bin/perl
+package FBOS::Client;
 use strict;
 use warnings;
 
-package FBOS::Client;
-
-my $VERSION = "0.4";
+our $VERSION = "0.4";
 
 use LWP::UserAgent;
 use JSON qw/ from_json to_json /;
 use Storable;
 use Digest::HMAC_SHA1 qw/ hmac_sha1_hex /;
 use MIME::Base64 qw/ encode_base64url decode_base64url encode_base64 decode_base64 /;
+use Carp;
 
 my $endpoint  = "http://mafreebox.freebox.fr";
 my $store     = "app_token";
@@ -115,7 +114,9 @@ sub login {
     my $res = $self->POST("login/authorize/", undef, {
         app_id      => $self->get_app_id(),
         app_name    => $self->get_app_name(),
-        app_version => $VERSION,
+#To avoid having to add again permissions on the freebox web interface, this is fixed
+        #app_version => $VERSION,
+        app_version => '0.4',
         device_name => "debian",
         permissions => {
             downloader => "true", parental   => "true", explorer   => "true",
@@ -141,17 +142,18 @@ sub app_token {
     my $app_token;
 
     if (-f $store) {
-        $app_token = retrieve $store or die "Couldn't restore application token from file found $store\n";
+        $app_token = retrieve $store or croak "Couldn't restore application token from file found $store\n";
     } else {
         my $auth_progress;
         $app_token = $self->login();
-        warn "Please confirm on the freebox\n";
+        $self->set_track_id( $app_token->{track_id} );
         do {
+            warn "Please confirm on the freebox\n";
             sleep 1;
             $self->auth_progress();
-        } while ( $self->get_auth_progress() eq "pending" );
-        die "User did not grant access, the return is:", $self->get_auth_progress() , "\n"
-            unless $self->get_auth_progress() eq "granted";
+        } while ( $self->get_auth_progress() eq 'pending' );
+        croak 'User did not grant access, the return is:', $self->get_auth_progress() , "\n"
+            unless $self->get_auth_progress() eq 'granted';
 
         store $app_token, $store;
     }
@@ -161,9 +163,9 @@ sub app_token {
 
 sub challenge {
     my $self = shift;
-    my $res = $self->GET("login/");
-    die "Challenge " , $self->get_status() , "\n" unless $self->get_success();
-    die "Challenge " , $self->get_error_msg() , "[", $self->get_error_code(), "]", "\n" unless $self->get_api_success();
+    my $res = $self->GET('login/');
+    croak 'Challenge ' , $self->get_status() , "\n" unless $self->get_success();
+    croak 'Challenge ' , $self->get_error_msg() , '[', $self->get_error_code(), ']', "\n" unless $self->get_api_success();
     $self->set_challenge($res->{challenge});
     return $res;
 }
@@ -195,14 +197,35 @@ sub connect {
 sub err_msg {
     my $self = shift;
     my $sn = +(caller(1))[3];
-    die "$sn: " , $self->get_status() , "\n" unless $self->get_success();
-    die "$sn: " , $self->get_error_msg() , "[", $self->get_error_code(), "]", "\n" unless $self->get_api_success();
+    croak "HTTP ERROR : $sn: " , $self->get_status() , "\n" unless $self->get_success();
+    croak "API ERROR : $sn: " , $self->get_error_msg() , ' [', $self->get_error_code(), ']', "\n" unless $self->get_api_success();
 }
 
 ############# API
 sub api_connection {
     my $self = shift;
     my $res = $self->GET("connection/");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_connection_config {
+    my $self = shift;
+    my $res = $self->GET("connection/config");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_connection_xdsl {
+    my $self = shift;
+    my $res = $self->GET("connection/xdsl");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_connection_ftth {
+    my $self = shift;
+    my $res = $self->GET("connection/ftth");
     $self->err_msg();
     return $res;
 }
@@ -215,27 +238,97 @@ sub api_dl_stats {
 }
 
 sub api_fs_tasks {
-    my $self = shift;
-    my $res = $self->GET("fs/tasks");
+    my ($self) = @_;
+    my $res = $self->GET('fs/tasks');
     $self->err_msg();
     return $res;
 }
 
-sub api_ls_files {
-    my ($self, $path) = @_;
-    $path = encode_base64( $path );
-    my $res = $self->GET("fs/ls/$path");
+sub api_fs_task {
+    my ($self, $id) = @_;
+    my $res = $self->GET("fs/tasks/$id");
     $self->err_msg();
-    $_->{path} = decode_base64( $_->{path}) for @$res;
+    return $res;
+}
+
+sub api_fs_task_delete {
+    my ($self, $id) = @_;
+    my $res = $self->DELETE("fs/tasks/$id");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fs_task_update {
+    my ($self, $id, $config) = @_;
+    my $res = $self->PUT("fs/tasks/$id", undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fs_ls {
+    my ($self, $path, $config, $namedPath) = @_;
+    
+	if(defined $namedPath) {
+		$path = encode_base64( $namedPath,'' );
+	}
+	
+	my $url = "fs/ls/$path";
+	
+	my $uri = URI->new( $url );
+	$uri->query_form($config);
+
+	my $res;
+	$res = $self->GET($uri);
+    
+	$self->err_msg();
+    $_->{namedPath} = decode_base64( $_->{path} ) for @$res;
+    return $res;
+}
+
+sub api_fs_info {
+    my ($self, $path) = @_;
+    my $res = $self->GET("fs/info/$path");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fs_mkdir {
+    my ($self, $config) = @_;
+    my $url = 'fs/mkdir/';
+    my $res = $self->POST($url, undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fs_cp {
+    my ($self, $config) = @_;
+    my $url = 'fs/cp/';
+    my $res = $self->POST($url, undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fs_hash {
+    my ($self, $config) = @_;
+    my $url = 'fs/hash/';
+    my $res = $self->POST($url, undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fs_hash_get {
+    my ($self, $id) = @_;
+    my $res = $self->GET("fs/tasks/$id/hash");
+    $self->err_msg();
     return $res;
 }
 
 sub api_airmedia_receiver {
     my ($self, $action, $type, $media) = @_;
     
-    die "AirMedia Receiver only accepts type photo or video\n" unless $type eq "video" or $type eq "photo";
-    $media = encode_base64($media,"") if defined $media and $type eq "photo";
-    my $res = $self->POST("airmedia/receivers/Freebox Player/", undef,
+    croak "AirMedia Receiver only accepts type photo or video\n" unless $type eq 'video' or $type eq 'photo';
+    $media = encode_base64($media,'') if defined $media and $type eq 'photo';
+    my $res = $self->POST('airmedia/receivers/Freebox Player/', undef,
         {
             action => $action,
             media_type => $type,
@@ -301,6 +394,23 @@ sub api_dhcp_dynamic_lease {
     return $res;
 }
 
+sub api_dhcp_set_static_lease {
+    my ($self, $content) = @_;
+    my $url = "dhcp/static_lease/";
+    my $res = $self->POST($url, undef, $content);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dhcp_update_static_lease {
+    my ($self, $config, $id) = @_;
+    my $url = "dhcp/static_lease/";
+    $url .= $id if defined $id;
+    my $res = $self->PUT($url, undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
 sub api_ftp_config {
     my ($self) = @_;
     my $res = $self->GET("ftp/config");
@@ -310,16 +420,21 @@ sub api_ftp_config {
     
 sub api_ftp_set_config {
     my ($self, $config) = @_;
-    my $res = $self->PUT("ftp/config", undef, $config);
+    my $res = $self->PUT('ftp/config', undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_fw_redirs {
+    my ($self) = @_;
+    my $res = $self->GET('fw/redir/');
     $self->err_msg();
     return $res;
 }
 
 sub api_fw_redir {
     my ($self, $id) = @_;
-    my $url = "fw/redir/";
-    $url .= $id if defined $id;
-    my $res = $self->GET($url);
+    my $res = $self->GET("fw/redir/$id");
     $self->err_msg();
     return $res;
 }
@@ -340,14 +455,14 @@ sub api_fw_del_redir {
 
 sub api_lcd_set_config {
     my ($self, $content) = @_;
-    my $res = $self->PUT("lcd/config/", undef, $content);
+    my $res = $self->PUT('lcd/config/', undef, $content);
     $self->err_msg();
     return $res;
 }
 
 sub api_switch_status {
     my ($self) = @_;
-    my $res = $self->GET("switch/status/");
+    my $res = $self->GET('switch/status/');
     $self->err_msg();
     return $res;
 }
@@ -359,16 +474,65 @@ sub api_switch_port_stat {
     return $res;
 }
 
-sub api_wifi_status {
+sub api_wifi_config {
     my ($self) = @_;
-    my $res = $self->GET("wifi");
+    my $res = $self->GET('wifi/config');
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_aps {
+    my ($self) = @_;
+    my $res = $self->GET('wifi/ap/');
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_ap {
+    my ($self, $ap) = @_;
+    my $res = $self->GET("wifi/ap/$ap");
     $self->err_msg();
     return $res;
 }
 
 sub api_wifi_sta {
-    my ($self, $bss) = @_;
-    my $res = $self->GET("wifi/stations/$bss");
+    my ($self, $ap) = @_;
+    my $res = $self->GET("wifi/ap/$ap/stations");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_allowed_comb {
+    my ($self, $ap) = @_;
+    my $res = $self->GET("wifi/ap/$ap/allowed_channel_comb");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_bsss {
+    my ($self) = @_;
+    my $res = $self->GET('wifi/bss/');
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_bss {
+    my ($self, $id) = @_;
+    my $res = $self->GET("wifi/bss/$id");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_ap_neigh {
+    my ($self, $ap) = @_;
+    my $res = $self->GET("wifi/ap/$ap/neighbors");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_wifi_ap_chanuse {
+    my ($self, $ap) = @_;
+    my $res = $self->GET("wifi/ap/$ap/channel_usage");
     $self->err_msg();
     return $res;
 }
@@ -387,40 +551,116 @@ sub api_system_reboot {
     return $res;
 }
 
-package main;
-use Data::Dumper;
-#binmode STDOUT,':utf8';
-#
-#Examples:
-#
+sub api_dl_tasks {
+    my ($self) = @_;
+    my $res = $self->GET("downloads/",undef,undef);
+    $self->err_msg();
+    return $res;
+}
 
-my $fbc = new FBOS::Client("FBPerl", "FBPerlTest");
-$fbc->connect();
-#print Dumper $fbc->api_connection;
-#print $fbc->api_connection->{ipv4} ,"\n";
-#print Dumper $fbc->api_dl_stats;
-#print Dumper $fbc->api_fs_tasks;
-#print Dumper $fbc->api_ls_files("Disque dur/Photos/samsung GT-I9300/");
-#$fbc->api_airmedia_receiver("start","video","http://anon.nasa-global.edgesuite.net/HD_downloads/GRAIL_launch_480.mov") and sleep 9 and $fbc->api_airmedia_receiver("stop","video");
-#$fbc->api_airmedia_receiver("start","photo","Disque dur/Photos/samsung GT-I9300/Camera/IMG_20140212_195511.jpg") and sleep 4 and $fbc->api_airmedia_receiver("stop","photo");
-#print Dumper $fbc->api_call_log;
-#$fbc->api_call_delete(400);
-#my $calls = $fbc->api_call_log ; $fbc->api_call_delete($_->{id}) for @$calls;
-#print Dumper $fbc->api_lan_browser("pub");
-#print Dumper $fbc->api_lan_browser("pub/ether-98:4B:E1:95:AC:84");
-#print Dumper $fbc->api_freeplug;
-#print Dumper $fbc->api_dhcp_conf;
-#print Dumper $fbc->api_dhcp_static_lease("00:13:10:30:21:97");
-#for (@{$fbc->api_dhcp_dynamic_lease}) { print Dumper $_ if $_->{ip} eq "192.168.1.27" }
-#print Dumper $fbc->api_ftp_config;
-#$fbc->api_ftp_set_config({enabled=>\0});
-#print Dumper $fbc->api_fw_redir();
-#$fbc->api_fw_add_redir( { enabled        => \1, comment        => "test", lan_port       => 4242, wan_port_end   => 4242,
-#    wan_port_start => 4242, lan_ip         => "192.168.1.42", ip_proto       => "tcp", src_ip         =>  "0.0.0.0" });
-#$fbc->api_fw_del_redir(1);
-#$fbc->api_lcd_set_config({brightness=>$_%100}) for (-50..50);
-#print Dumper $fbc->api_switch_status;
-#print Dumper $fbc->api_switch_port_stat(2);
-#print Dumper $fbc->api_wifi_status;
-#print Dumper $fbc->api_wifi_sta("perso");
-#$fbc->api_system_reboot;
+sub api_dl_task {
+    my ($self, $id) = @_;
+    my $res = $self->GET("downloads/$id");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_delete {
+    my ($self, $id) = @_;
+    my $res = $self->DELETE("downloads/$id");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_erase {
+    my ($self, $id) = @_;
+    my $res = $self->DELETE("downloads/$id/erase");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_log {
+    my ($self, $id) = @_;
+    my $res = $self->GET("downloads/$id/log");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_files {
+    my ($self, $id) = @_;
+    my $res = $self->GET("downloads/$id/files");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_trackers {
+    my ($self, $id) = @_;
+    my $res = $self->GET("downloads/$id/trackers");
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_add_tracker {
+    my ($self, $id, $tracker) = @_;
+    my $res = $self->POST("downloads/$id/trackers", undef, $tracker);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_update_tracker {
+    my ($self, $id, $announce, $tracker) = @_;
+    my $res = $self->PUT("downloads/$id/trackers/$announce", undef, $tracker);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_dl_task_remove_tracker {
+    my ($self, $id, $announce, $tracker) = @_;
+    my $res = $self->DELETE("downloads/$id/trackers/$announce", undef, $tracker);
+    $self->err_msg();
+    return $res;
+}
+
+sub api_storage_disks {
+	my ($self, $id) = @_;
+	my $res = $self->GET('storage/disk/');
+	foreach my $disk (@{$res}) {
+		$_->{namedPath} = decode_base64( $_->{path} ) for @{$disk->{partitions}};
+	}
+    $self->err_msg();
+    return $res;
+}
+
+sub api_storage_disk {
+	my ($self, $id) = @_;
+	my $res = $self->GET("storage/disk/$id");
+	$_->{namedPath} = decode_base64( $_->{path} ) for @{$res->{partitions}};
+    $self->err_msg();
+    return $res;
+}
+
+sub api_storage_partitions {
+	my ($self) = @_;
+	my $res = $self->GET('storage/partition/');
+    $self->err_msg();
+	$_->{namedPath} = decode_base64( $_->{path} ) for @$res;
+    return $res;
+}
+
+sub api_storage_partition {
+	my ($self, $id) = @_;
+	my $res = $self->GET("storage/partition/$id");
+    $self->err_msg();
+	$res->{namedPath} = decode_base64( $res->{path} );
+    return $res;
+}
+
+
+sub api_storage_update_partition {
+	my ($self, $id, $config) = @_;
+	my $res = $self->PUT("storage/partition/$id", undef, $config);
+    $self->err_msg();
+    return $res;
+}
+
+1;
